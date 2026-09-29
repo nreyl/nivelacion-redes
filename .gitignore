@@ -1,0 +1,16 @@
+# Credenciales y material sensible del reto (código de ética: no compartir)
+*.local.md
+alpes_keys.log
+*keys*.log
+SSLKEYLOGFILE
+
+# Capturas de tráfico
+*.pcap
+*.pcapng
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
