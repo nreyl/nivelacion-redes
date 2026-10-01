@@ -1,6 +1,7 @@
 # Credenciales y material sensible del reto (código de ética: no compartir)
 *.local.md
 alpes_keys.log
+sesion_alpespay.log
 *keys*.log
 SSLKEYLOGFILE
 
@@ -14,3 +15,6 @@ __pycache__/
 
 # macOS
 .DS_Store
+
+# Ambiente Local
+.env
